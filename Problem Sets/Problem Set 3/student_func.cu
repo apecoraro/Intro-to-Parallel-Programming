@@ -81,6 +81,8 @@ steps.
 #include "device_launch_parameters.h"
 #include "utils.h"
 
+#include <algorithm>
+
 __global__ void
 inclusive_min_max_scan(
     const float* const d_minReadBuffer,
@@ -141,6 +143,8 @@ compute_histogram(
         int  imageIndex1d = (nx * imageIndex2d.y) + imageIndex2d.x;
         float lumValue = d_logLuminance[imageIndex1d];
         size_t bin = static_cast<size_t>((lumValue - lumMin) / lumRange * numBins);
+        if (bin >= numBins)
+            bin = numBins - 1;
         atomicAdd(&d_histogramBuffer[bin], 1);
     }
 }
@@ -148,12 +152,15 @@ compute_histogram(
 __global__ void
 exclusive_sum_scan(
     unsigned int* const d_buffer,
-    int bufSize,
+    int bufCount,
+    int startIndex,
+    int spacingOffset,
     int neighborOffset)
 {
-    int writeIndex1d = ((blockIdx.x * blockDim.x) + threadIdx.x) * neighborOffset;
+    int baseIndex = ((blockIdx.x * blockDim.x) + threadIdx.x);
+    int writeIndex1d = startIndex + (spacingOffset * baseIndex);
 
-    if (writeIndex1d >= bufSize)
+    if (writeIndex1d < bufCount)
     {
         int readIndex1 = writeIndex1d - neighborOffset;
         int readIndex2 = writeIndex1d;
@@ -161,17 +168,21 @@ exclusive_sum_scan(
         int read2 = d_buffer[readIndex2];
         d_buffer[writeIndex1d] = read1 + read2;
     }
+
 }
 
 __global__ void
 exclusive_downsweep_sum_scan(
     unsigned int* const d_buffer,
-    int bufSize,
+    int bufCount,
+    int startIndex,
+    int spacingOffset,
     int neighborOffset)
 {
-    int threadIndex = ((blockIdx.x * blockDim.x) + threadIdx.x) * neighborOffset;
+    int baseIndex = ((blockIdx.x * blockDim.x) + threadIdx.x);
+    int threadIndex = startIndex + (spacingOffset * baseIndex);
 
-    if (threadIndex >= bufSize)
+    if (threadIndex < bufCount)
     {
         int backIndex = threadIndex - neighborOffset;
         int frontIndex = threadIndex;
@@ -199,30 +210,31 @@ void your_histogram_and_prefixsum(
     const dim3 gridSize(
         (numCols + blockSize.x - 1) / blockSize.x,
         (numRows + blockSize.y - 1) / blockSize.y);
+
     float* d_minScanBuffer1 = nullptr;
     cudaMalloc(&d_minScanBuffer1, (numRows * numCols) * sizeof(float));
     float* d_minScanBuffer2 = nullptr;
     cudaMalloc(&d_minScanBuffer2, (numRows * numCols) * sizeof(float));
+
     float* d_minReadBuffer = const_cast<float*>(d_logLuminance);
     float* d_minWriteBuffer = d_minScanBuffer1;
+
     float* d_maxScanBuffer1 = nullptr;
     cudaMalloc(&d_maxScanBuffer1, (numRows * numCols) * sizeof(float));
     float* d_maxScanBuffer2 = nullptr;
     cudaMalloc(&d_maxScanBuffer2, (numRows * numCols) * sizeof(float));
     float* d_maxReadBuffer = const_cast<float*>(d_logLuminance);
     float* d_maxWriteBuffer = d_maxScanBuffer1;
+
     int neighborOffset = 1;
     int numItems = (numRows * numCols);
     while (neighborOffset < numItems - 1)
     {
-        inclusive_min_max_scan << <gridSize, blockSize >> >(
+        inclusive_min_max_scan<<<gridSize, blockSize>>>(
             d_minReadBuffer, d_maxReadBuffer,
             d_minWriteBuffer, d_maxWriteBuffer,
             neighborOffset,
-            numCols, numRows);
-
-        //cudaDeviceSynchronize();
-        //checkCudaErrors(cudaGetLastError());
+            numRows, numCols);
 
         if (neighborOffset == 1)
         {
@@ -241,13 +253,13 @@ void your_histogram_and_prefixsum(
         neighborOffset <<= 1;
     }
 
-    cudaDeviceSynchronize();
-    checkCudaErrors(cudaGetLastError());
-
     // read back the last item from the read buffer
     // (note that the current read buffer was the most recent write buffer)
     cudaMemcpy(&min_logLum, &d_minReadBuffer[numItems - 1], sizeof(float), cudaMemcpyDeviceToHost);
+    checkCudaErrors(cudaGetLastError());
+
     cudaMemcpy(&max_logLum, &d_maxReadBuffer[numItems - 1], sizeof(float), cudaMemcpyDeviceToHost);
+    checkCudaErrors(cudaGetLastError());
 
     cudaFree(d_minReadBuffer);
     cudaFree(d_minWriteBuffer);
@@ -262,53 +274,54 @@ void your_histogram_and_prefixsum(
 
     unsigned int* d_histogramBuffer = nullptr;
     cudaMalloc(&d_histogramBuffer, sizeof(unsigned int) * numBins);
+    checkCudaErrors(cudaGetLastError());
+    cudaMemset(d_histogramBuffer, 0, sizeof(unsigned int) * numBins);
+    checkCudaErrors(cudaGetLastError());
 
-    compute_histogram << <gridSize, blockSize >> >(
-        d_logLuminance, numCols, numRows,
+    compute_histogram<<<gridSize, blockSize>>>(
+        d_logLuminance, numRows, numCols,
         d_histogramBuffer, numBins,
         min_logLum, lumRange);
 
-    //cudaDeviceSynchronize();
-    //checkCudaErrors(cudaGetLastError());
-
     cudaMemcpy(d_cdf, d_histogramBuffer,
         sizeof(unsigned int) * numBins, cudaMemcpyDeviceToDevice);
+    checkCudaErrors(cudaGetLastError());
 
     /*4) Perform an exclusive scan (prefix sum) on the histogram to get
     the cumulative distribution of luminance values (this should go in the
     incoming d_cdf pointer which already has been allocated for you)       */
-    const dim3 exclusiveBlockSize(32, 1, 1);
-    dim3 exclusiveGridSize(numBins / exclusiveBlockSize.x, 1, 1);
+    dim3 excBlockSize(128, 1, 1);
+    const dim3 excGridSize(
+        std::max(static_cast<int>(numBins / excBlockSize.x), 1), 1, 1);
 
     neighborOffset = 1;
-    while (neighborOffset < numBins - 1)
+    int startIndex = 1;
+    int spacingOffset = 2;
+    while (startIndex <= numBins - 1)
     {
-        exclusiveGridSize.x >>= 1;
+        excBlockSize.x = std::max(1u, excBlockSize.x >> 1);
 
-        exclusive_sum_scan << <exclusiveBlockSize, exclusiveGridSize >> >(
-            d_cdf, numBins, neighborOffset);
-
-        cudaDeviceSynchronize();
-        checkCudaErrors(cudaGetLastError());
+        exclusive_sum_scan<<<excGridSize, excBlockSize>>>(
+            d_cdf, numBins, startIndex, spacingOffset, neighborOffset);
 
         neighborOffset <<= 1;
+        startIndex += neighborOffset;
+        spacingOffset <<= 1;
     }
-
-    cudaDeviceSynchronize();
-    checkCudaErrors(cudaGetLastError());
 
     // reset right most element to identity/zero.
     cudaMemset(&d_cdf[numBins - 1], 0, sizeof(int));
+    checkCudaErrors(cudaGetLastError());
 
     while (neighborOffset > 1)
     {
-        exclusive_downsweep_sum_scan << <exclusiveBlockSize, exclusiveGridSize >> >(
-            d_cdf, numBins, neighborOffset);
-
-        //cudaDeviceSynchronize();
-        //checkCudaErrors(cudaGetLastError());
-
-        exclusiveGridSize.x <<= 1;
+        startIndex -= neighborOffset;
         neighborOffset >>= 1;
+        spacingOffset >>= 1;
+
+        exclusive_downsweep_sum_scan<<<excGridSize, excBlockSize>>>(
+            d_cdf, numBins, startIndex, spacingOffset, neighborOffset);
+
+        excBlockSize.x <<= 1;
     }
 }
